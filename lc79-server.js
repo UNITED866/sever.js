@@ -1,71 +1,50 @@
 // ══════════════════════════════════════════════════
-// LC79 KEY SERVER - Node.js
-// Chạy: node server.js
-// PORT: 3000 (có thể đổi)
+// LC79 KEY SERVER v2.0 - Render Compatible
+// Dùng in-memory storage - KHÔNG cần file/database
 // ══════════════════════════════════════════════════
 const http = require('http');
-const fs   = require('fs');
-const path = require('path');
-const crypto = require('crypto');
 const url  = require('url');
 
-const PORT     = process.env.PORT || 3000;
-const DB_FILE  = path.join(__dirname, 'keys.json');
+const PORT       = process.env.PORT || 3000;
 const ADMIN_USER = 'buivanhoan';
 const ADMIN_PASS = 'hzetnz212';
-const DAY      = 86400000;
+const DAY        = 86400000;
 
-// ── DB helpers ──
-function loadDB() {
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-  catch(e) { return { keys: {} }; }
-}
-function saveDB(db) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-}
+// IN-MEMORY DB
+let DB = { keys: {} };
 
-// ── Gen key ──
 function genKey() {
   const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const s = () => Array.from({length:4}, () => c[Math.floor(Math.random()*c.length)]).join('');
   return `LC79-${s()}-${s()}-${s()}`;
 }
 
-// ── Get real IP ──
 function getIP(req) {
-  const raw =
-    req.headers['x-forwarded-for'] ||
-    req.headers['x-real-ip']       ||
-    req.socket.remoteAddress       || '';
-  return raw.split(',')[0].trim().replace('::ffff:','');
+  const raw = req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || req.socket.remoteAddress || '';
+  return raw.split(',')[0].trim().replace('::ffff:', '');
 }
 
-// ── CORS headers ──
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
 }
 
-// ── JSON response ──
 function json(res, code, data) {
   cors(res);
-  res.writeHead(code, {'Content-Type':'application/json'});
+  res.writeHead(code, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(data));
 }
 
-// ── Admin auth ──
 function checkAdmin(req) {
   const auth = req.headers['authorization'] || '';
-  const b64  = auth.replace('Basic ','');
   try {
-    const [u,p] = Buffer.from(b64,'base64').toString().split(':');
+    const [u, p] = Buffer.from(auth.replace('Basic ', ''), 'base64').toString().split(':');
     return u === ADMIN_USER && p === ADMIN_PASS;
   } catch(e) { return false; }
 }
 
-// ── Body parser ──
-function body(req) {
+function getBody(req) {
   return new Promise(resolve => {
     let d = '';
     req.on('data', c => d += c);
@@ -73,158 +52,133 @@ function body(req) {
   });
 }
 
+function fmtLeft(expireAt) {
+  const diff = expireAt - Date.now();
+  if (diff <= 0) return 'Hết hạn';
+  const d = Math.floor(diff / DAY);
+  const h = Math.floor((diff % DAY) / 3600000);
+  const m = Math.floor((diff % 3600000) / 60000);
+  return d > 0 ? `${d} ngày ${h} giờ` : `${h} giờ ${m} phút`;
+}
+
+function maskIP(ip) {
+  if (!ip) return null;
+  const parts = ip.split('.');
+  if (parts.length === 4) return `${parts[0]}.${parts[1]}.*.*`;
+  return ip.slice(0, 6) + '***';
+}
+
 // ══════════════════════════════════════════════════
-// HTTP SERVER
+// SERVER
 // ══════════════════════════════════════════════════
 const server = http.createServer(async (req, res) => {
-  const u   = url.parse(req.url, true);
+  const u        = url.parse(req.url, true);
   const pathname = u.pathname;
-  const ip  = getIP(req);
+  const ip       = getIP(req);
 
-  // Preflight
   if (req.method === 'OPTIONS') { cors(res); res.writeHead(204); res.end(); return; }
 
-  // ── [GET] /validate?key=LC79-XXXX-XXXX-XXXX ──
-  // Dùng bởi client Tampermonkey để xác thực key + bind IP
-  if (req.method === 'GET' && pathname === '/validate') {
-    const k = u.query.key || '';
-    const db = loadDB();
-    const entry = db.keys[k];
+  // Health check
+  if (pathname === '/') {
+    cors(res);
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('LC79 Key Server v2.0 OK | Keys: ' + Object.keys(DB.keys).length);
+    return;
+  }
 
-    if (!entry) return json(res, 200, { valid: false, reason: 'Key không tồn tại' });
-    if (entry.revoked) return json(res, 200, { valid: false, reason: 'Key đã bị thu hồi' });
+  // ── VALIDATE KEY ──
+  if (req.method === 'GET' && pathname === '/validate') {
+    const k     = (u.query.key || '').toUpperCase().trim();
+    const entry = DB.keys[k];
+
+    if (!entry)         return json(res, 200, { valid: false, reason: 'Key không tồn tại' });
+    if (entry.revoked)  return json(res, 200, { valid: false, reason: 'Key đã bị thu hồi' });
     if (Date.now() > entry.expireAt) return json(res, 200, { valid: false, reason: 'Key đã hết hạn' });
 
-    // IP binding: nếu chưa có IP → gán IP này
+    // IP Binding
     if (!entry.boundIP) {
       entry.boundIP = ip;
       entry.boundAt = Date.now();
-      db.keys[k] = entry;
-      saveDB(db);
-      console.log(`[BIND] Key ${k} → IP ${ip}`);
-    }
-    // Nếu đã có IP → kiểm tra
-    else if (entry.boundIP !== ip) {
-      console.log(`[BLOCK] Key ${k} IP mismatch: bound=${entry.boundIP} req=${ip}`);
+      console.log(`[BIND] ${k} → ${ip}`);
+    } else if (entry.boundIP !== ip) {
+      console.log(`[BLOCK] ${k} bound=${entry.boundIP} req=${ip}`);
       return json(res, 200, {
         valid: false,
-        reason: `Key này đã được đăng ký trên IP khác (${entry.boundIP.slice(0,-3)}***)`
+        reason: `Key đã đăng ký trên máy khác (${maskIP(entry.boundIP)})`
       });
     }
 
-    // Cập nhật last seen
     entry.lastSeen = Date.now();
     entry.lastIP   = ip;
-    db.keys[k] = entry;
-    saveDB(db);
 
-    const diff = entry.expireAt - Date.now();
-    const d    = Math.floor(diff / DAY);
-    const h    = Math.floor((diff % DAY) / 3600000);
     return json(res, 200, {
-      valid: true,
+      valid:    true,
       expireAt: entry.expireAt,
-      timeLeft: d > 0 ? `${d} ngày ${h} giờ` : `${h} giờ`,
-      note: entry.note || ''
+      timeLeft: fmtLeft(entry.expireAt),
+      note:     entry.note || ''
     });
   }
 
-  // ════ ADMIN ROUTES (yêu cầu Basic Auth) ════
+  // ── ADMIN ROUTES ──
+  if (!checkAdmin(req)) return json(res, 401, { error: 'Unauthorized' });
 
-  if (!checkAdmin(req)) {
-    if (pathname.startsWith('/admin')) {
-      return json(res, 401, { error: 'Unauthorized' });
-    }
-  }
-
-  // ── [POST] /admin/create ──
+  // Tạo key
   if (req.method === 'POST' && pathname === '/admin/create') {
-    if (!checkAdmin(req)) return json(res, 401, { error: 'Unauthorized' });
-    const b = await body(req);
+    const b    = await getBody(req);
     const days = parseInt(b.days) || 1;
-    const note = b.note || '';
-    const db   = loadDB();
+    const note = (b.note || '').trim() || '—';
     const k    = genKey();
-    db.keys[k] = {
+    DB.keys[k] = {
       expireAt:  Date.now() + days * DAY,
       createdAt: Date.now(),
       note, revoked: false,
-      boundIP: null, boundAt: null,
-      lastSeen: null, lastIP: null
+      boundIP: null, boundAt: null, lastSeen: null, lastIP: null
     };
-    saveDB(db);
-    console.log(`[CREATE] Key ${k} | ${days} ngày | ${note}`);
-    return json(res, 200, { success: true, key: k, days, expireAt: db.keys[k].expireAt });
+    console.log(`[CREATE] ${k} | ${days}d | ${note}`);
+    return json(res, 200, { success: true, key: k, days, expireAt: DB.keys[k].expireAt, timeLeft: fmtLeft(DB.keys[k].expireAt) });
   }
 
-  // ── [GET] /admin/list ──
+  // Danh sách key
   if (req.method === 'GET' && pathname === '/admin/list') {
-    if (!checkAdmin(req)) return json(res, 401, { error: 'Unauthorized' });
-    const db = loadDB();
-    const now = Date.now();
-    const list = Object.entries(db.keys).map(([k, e]) => ({
-      key: k,
-      note: e.note,
-      expireAt: e.expireAt,
-      revoked: e.revoked,
-      expired: now > e.expireAt,
-      boundIP: e.boundIP ? e.boundIP.slice(0,-3)+'***' : null,
-      lastSeen: e.lastSeen,
-      createdAt: e.createdAt
-    })).sort((a,b) => b.createdAt - a.createdAt);
-    return json(res, 200, { success: true, keys: list });
+    const now  = Date.now();
+    const list = Object.entries(DB.keys)
+      .map(([k, e]) => ({
+        key: k, note: e.note,
+        expireAt: e.expireAt, timeLeft: fmtLeft(e.expireAt),
+        revoked: e.revoked, expired: now > e.expireAt,
+        boundIP: maskIP(e.boundIP),
+        lastSeen: e.lastSeen, createdAt: e.createdAt
+      }))
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    return json(res, 200, { success: true, total: list.length, keys: list });
   }
 
-  // ── [POST] /admin/modify ──
-  // body: { key, action: 'add'|'sub'|'revoke'|'delete'|'unbind', days }
+  // Sửa key (add/sub/revoke/unbind/delete)
   if (req.method === 'POST' && pathname === '/admin/modify') {
-    if (!checkAdmin(req)) return json(res, 401, { error: 'Unauthorized' });
-    const b  = await body(req);
-    const db = loadDB();
-    const k  = b.key;
-    if (!db.keys[k]) return json(res, 200, { success: false, reason: 'Key không tồn tại' });
-    const e  = db.keys[k];
-    const days = parseInt(b.days) || 1;
+    const b      = await getBody(req);
+    const k      = (b.key || '').toUpperCase().trim();
+    const action = b.action;
+    const days   = parseInt(b.days) || 1;
 
-    if (b.action === 'add') {
-      const base = Math.max(e.expireAt, Date.now());
-      e.expireAt = base + days * DAY;
-      e.revoked  = false;
-    }
-    else if (b.action === 'sub') {
-      e.expireAt = Math.max(Date.now() - 1000, e.expireAt - days * DAY);
-    }
-    else if (b.action === 'revoke') {
-      e.revoked = true;
-    }
-    else if (b.action === 'unbind') {
-      // Reset IP binding → cho phép máy khác dùng
-      e.boundIP = null; e.boundAt = null;
-      console.log(`[UNBIND] Key ${k}`);
-    }
-    else if (b.action === 'delete') {
-      delete db.keys[k];
-      saveDB(db);
-      return json(res, 200, { success: true });
-    }
+    if (!DB.keys[k]) return json(res, 200, { success: false, reason: 'Key không tồn tại' });
 
-    db.keys[k] = e;
-    saveDB(db);
-    return json(res, 200, { success: true, key: k });
-  }
+    const e = DB.keys[k];
+    if      (action === 'add')    { e.expireAt = Math.max(e.expireAt, Date.now()) + days * DAY; e.revoked = false; }
+    else if (action === 'sub')    { e.expireAt = Math.max(Date.now() - 1000, e.expireAt - days * DAY); }
+    else if (action === 'revoke') { e.revoked = true; }
+    else if (action === 'unbind') { e.boundIP = null; e.boundAt = null; console.log(`[UNBIND] ${k}`); }
+    else if (action === 'delete') { delete DB.keys[k]; console.log(`[DELETE] ${k}`); return json(res, 200, { success: true }); }
 
-  // ── [GET] / ── Health check
-  if (pathname === '/') {
-    cors(res); res.writeHead(200, {'Content-Type':'text/plain'});
-    res.end('LC79 Key Server v1.0 - OK');
-    return;
+    console.log(`[${action.toUpperCase()}] ${k}`);
+    return json(res, 200, { success: true, key: k, timeLeft: fmtLeft(e.expireAt || 0) });
   }
 
   json(res, 404, { error: 'Not found' });
 });
 
-server.listen(PORT, () => {
-  console.log(`\n✅ LC79 Key Server đang chạy tại http://localhost:${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n✅ LC79 Key Server v2.0 | Port: ${PORT}`);
   console.log(`   Admin: ${ADMIN_USER} / ${ADMIN_PASS}`);
-  console.log(`   DB:    ${DB_FILE}\n`);
 });
+
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
